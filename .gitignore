@@ -1,0 +1,13 @@
+# CMake / Ninja 构建产物
+/build/
+/install/
+
+# 本机覆盖配置（initial-cache，含个人路径）
+cmake/local.cmake
+cmake/config.local.cmake
+
+# 编辑器与系统文件
+.vs/
+.vscode/
+*.user
+Thumbs.db
