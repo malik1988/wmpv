@@ -37,7 +37,14 @@ if(NOT CMAKE_CXX_COMPILER)
     set(CMAKE_CXX_COMPILER "${WMPV_CLANG_CL}")
 endif()
 
-project(wmpv LANGUAGES CXX)
+project(wmpv VERSION 1.0.0 LANGUAGES CXX)
+
+# Single source of truth for the version number. Everything else (the C++
+# header, the Windows VERSIONINFO resource, --version output and the UI badge)
+# is derived from PROJECT_VERSION by configure_file.
+configure_file("${WMPV_SRC_DIR}/version.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/version.h" @ONLY)
+set(WMPV_VERSION_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/version.h")
 
 # Drive the link through clang-cl with lld-link so we can consume the GNU `ar`
 # archives (libmpv.a / libplacebo.a). CMake's default MSVC path goes through
@@ -97,13 +104,15 @@ set(WMPV_SOURCES
 
 add_executable(wmpv WIN32 ${WMPV_SOURCES})
 
-# MSVC 的 rc.exe 不输出依赖信息；显式声明图标依赖，这样改 assets/icon.ico
-# 后 Ninja 才会重新编译 .res 并刷新 exe / 窗口标题栏的内嵌图标。
-set_property(SOURCE "${WMPV_SRC_DIR}/wmpv.rc" APPEND PROPERTY OBJECT_DEPENDS "${WMPV_ICON}")
+# MSVC 的 rc.exe 不输出依赖信息；显式声明图标与生成头文件的依赖，这样改
+# assets/icon.ico 或版本号后 Ninja 才会重新编译 .res 并刷新 exe 资源。
+set_property(SOURCE "${WMPV_SRC_DIR}/wmpv.rc" APPEND PROPERTY OBJECT_DEPENDS
+             "${WMPV_ICON};${WMPV_VERSION_HEADER}")
 
 target_include_directories(wmpv PRIVATE
     "${WMPV_SRC_DIR}"
     "${WMPV_MPV_INCLUDE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 target_compile_definitions(wmpv PRIVATE UNICODE _UNICODE)

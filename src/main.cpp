@@ -14,6 +14,7 @@
 #include "util.h"
 #include "theme.h"
 #include "i18n.h"
+#include "version.h"
 #include <gdiplus.h>
 using namespace Gdiplus;
 
@@ -55,7 +56,6 @@ public:
     ui::Theme theme;
     std::vector<std::wstring> playlist;
     std::vector<std::wstring> pendingSubs;
-    std::vector<MenuItem> menuItems;
     size_t cur = 0;
     bool fullscreen = false;
     bool seekDrag = false, volDrag = false;
@@ -92,6 +92,7 @@ public:
 
     void syncLayers();
     void renderLayer(bool title);
+    void renderPopup();
     void refreshLayers();
     void setLayerVisible(bool title, bool show);
     void updateLayers(int x, int y);
@@ -214,6 +215,42 @@ void App::onPaint(HDC hdc) {
 
 // ---------- transparent floating bars ----------
 
+// Copies a GDI+ PARGB bitmap into a WS_EX_LAYERED window with per-pixel alpha.
+static void BlendBitmapToLayered(HWND layer, Bitmap &bmp, int w, int h) {
+    BitmapData data;
+    Rect lockRect(0, 0, w, h);
+    if (bmp.LockBits(&lockRect, ImageLockModeRead,
+                     PixelFormat32bppPARGB, &data) != Ok)
+        return;
+
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi = {0};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (dib && bits) {
+        HBITMAP old = (HBITMAP)SelectObject(mem, dib);
+        for (int y = 0; y < h; y++)
+            memcpy((BYTE *)bits + (size_t)y * w * 4,
+                   (BYTE *)data.Scan0 + (LONG_PTR)y * data.Stride, (size_t)w * 4);
+        SIZE size = {w, h};
+        POINT src = {0, 0};
+        BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        UpdateLayeredWindow(layer, screen, nullptr, &size, mem, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mem, old);
+        DeleteObject(dib);
+    }
+    bmp.UnlockBits(&data);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
 void App::renderLayer(bool title) {
     HWND layer = title ? titleLayer : ctrlLayer;
     if (!layer)
@@ -248,38 +285,7 @@ void App::renderLayer(bool title) {
         chrome.setTheme(saved);
     }
 
-    BitmapData data;
-    Rect lockRect(0, 0, w, h);
-    if (bmp.LockBits(&lockRect, ImageLockModeRead,
-                     PixelFormat32bppPARGB, &data) != Ok)
-        return;
-
-    HDC screen = GetDC(nullptr);
-    HDC mem = CreateCompatibleDC(screen);
-    BITMAPINFO bi = {0};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void *bits = nullptr;
-    HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (dib && bits) {
-        HBITMAP old = (HBITMAP)SelectObject(mem, dib);
-        for (int y = 0; y < h; y++)
-            memcpy((BYTE *)bits + (size_t)y * w * 4,
-                   (BYTE *)data.Scan0 + (LONG_PTR)y * data.Stride, (size_t)w * 4);
-        SIZE size = {w, h};
-        POINT src = {0, 0};
-        BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        UpdateLayeredWindow(layer, screen, nullptr, &size, mem, &src, 0, &bf, ULW_ALPHA);
-        SelectObject(mem, old);
-        DeleteObject(dib);
-    }
-    bmp.UnlockBits(&data);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
+    BlendBitmapToLayered(layer, bmp, w, h);
 }
 
 void App::syncLayers() {
@@ -578,47 +584,301 @@ void App::toggleFullscreen() {
                      savedRect.right - savedRect.left, savedRect.bottom - savedRect.top,
                      SWP_NOZORDER | SWP_FRAMECHANGED);
     }
+    chrome.setFullscreen(fullscreen);
     syncLayers();
     updateLayers(lastMouseX, lastMouseY);
     InvalidateRect(hwnd, nullptr, TRUE);
 }
 
-// ---------- owner drawn popup menus ----------
+// ---------- translucent rounded popup menus ----------
+
+struct PopupState {
+    App *app = nullptr;
+    HWND hwnd = nullptr;
+    std::vector<MenuVisual> visuals;
+    std::vector<UINT> ids;
+    RECT card = {0};            // rounded card in popup window coordinates
+    int bmpW = 0, bmpH = 0;
+    int contentH = 0;           // total height of all rows
+    int viewH = 0;              // visible height (contentH when it fits)
+    int scrollY = 0;
+    int hot = -1;
+    int result = 0;
+    bool done = false;
+    HWND baseFg = nullptr;
+};
+static PopupState *g_popup = nullptr;
+
+// -2 outside the card, -1 on a header/separator, otherwise the item index.
+static int PopupHit(int x, int y) {
+    PopupState &s = *g_popup;
+    if (x < s.card.left || x >= s.card.right ||
+        y < s.card.top || y >= s.card.bottom)
+        return -2;
+    int ry = y - s.card.top - s.app->chrome.menuPadV() + s.scrollY;
+    int acc = 0;
+    for (size_t i = 0; i < s.visuals.size(); i++) {
+        int hh = s.app->chrome.menuItemHeight(s.visuals[i].kind);
+        if (ry >= acc && ry < acc + hh) {
+            if (s.ids[i] == 0 || s.visuals[i].kind == 1 || s.visuals[i].kind == 2)
+                return -1;
+            return (int)i;
+        }
+        acc += hh;
+    }
+    return -1;
+}
+
+static void PopupScrollBy(int dy) {
+    PopupState &s = *g_popup;
+    int maxY = s.contentH - s.viewH;
+    if (maxY <= 0)
+        return;
+    int n = s.scrollY + dy;
+    if (n < 0) n = 0;
+    if (n > maxY) n = maxY;
+    if (n != s.scrollY) {
+        s.scrollY = n;
+        s.app->renderPopup();
+    }
+}
+
+static void PopupEnsureVisible() {
+    PopupState &s = *g_popup;
+    if (s.hot < 0 || s.contentH <= s.viewH)
+        return;
+    int top = 0;
+    for (int i = 0; i < s.hot; i++)
+        top += s.app->chrome.menuItemHeight(s.visuals[i].kind);
+    int hh = s.app->chrome.menuItemHeight(s.visuals[s.hot].kind);
+    if (top < s.scrollY) s.scrollY = top;
+    else if (top + hh > s.scrollY + s.viewH) s.scrollY = top + hh - s.viewH;
+}
+
+static void PopupMove(int dir) {
+    PopupState &s = *g_popup;
+    int n = (int)s.visuals.size();
+    if (n == 0)
+        return;
+    int i = s.hot;
+    for (int k = 0; k < n; k++) {
+        i += dir;
+        if (i < 0) i = n - 1;
+        if (i >= n) i = 0;
+        if (s.ids[i] != 0 && s.visuals[i].kind != 1 && s.visuals[i].kind != 2) {
+            s.hot = i;
+            break;
+        }
+    }
+    PopupEnsureVisible();
+    s.app->renderPopup();
+}
+
+static LRESULT CALLBACK PopupWndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_ERASEBKGND)
+        return 1;
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        BeginPaint(w, &ps);
+        EndPaint(w, &ps);           // pixels come from UpdateLayeredWindow
+        return 0;
+    }
+    if (m == WM_SETCURSOR) {
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
+    }
+    return DefWindowProcW(w, m, wp, lp);
+}
+
+void App::renderPopup() {
+    PopupState *s = g_popup;
+    if (!s || !s->hwnd || s->bmpW <= 0 || s->bmpH <= 0)
+        return;
+    Bitmap bmp(s->bmpW, s->bmpH, PixelFormat32bppPARGB);
+    {
+        Graphics g(&bmp);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        g.Clear(Color(0, 0, 0, 0));
+        chrome.paintMenu(&g, s->card, s->visuals.data(), (int)s->visuals.size(),
+                         s->hot, s->scrollY, s->viewH);
+    }
+    BlendBitmapToLayered(s->hwnd, bmp, s->bmpW, s->bmpH);
+}
 
 int App::runMenu(const std::vector<MenuItem> &items, const RECT &anchor) {
-    menuItems = items;
-    HMENU hmenu = CreatePopupMenu();
-    HBRUSH menuBg = CreateSolidBrush(theme.surface);
-    MENUINFO mi = {0};
-    mi.cbSize = sizeof(mi);
-    mi.fMask = MIM_BACKGROUND;
-    mi.hbrBack = menuBg;
-    SetMenuInfo(hmenu, &mi);
+    if (g_popup || items.empty())
+        return 0;
 
-    for (size_t i = 0; i < menuItems.size(); i++) {
-        MENUITEMINFOW ii = {0};
-        ii.cbSize = sizeof(ii);
-        ii.fMask = MIIM_FTYPE | MIIM_ID | MIIM_DATA | MIIM_STATE;
-        ii.fType = MFT_OWNERDRAW;
-        ii.wID = menuItems[i].id;
-        ii.dwItemData = (ULONG_PTR)&menuItems[i];
-        ii.fState = (menuItems[i].v.kind == 1 || menuItems[i].v.kind == 2)
-                        ? MFS_DISABLED : MFS_ENABLED;
-        InsertMenuItemW(hmenu, (UINT)i, TRUE, &ii);
+    PopupState st;
+    st.app = this;
+    st.baseFg = GetForegroundWindow();
+    for (size_t i = 0; i < items.size(); i++) {
+        st.visuals.push_back(items[i].v);
+        st.ids.push_back(items[i].id);
+        st.contentH += chrome.menuItemHeight(items[i].v.kind);
     }
+
+    int shadow = chrome.menuShadowPad();
+    int padV = chrome.menuPadV();
+    int cardW = chrome.menuItemWidth();
 
     POINT pt = {anchor.right, anchor.top - util::Scale(4, dpi)};
     ClientToScreen(hwnd, &pt);
+    MONITORINFO mon = {0};
+    mon.cbSize = sizeof(mon);
+    RECT wa = {0};
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mon))
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    else
+        wa = mon.rcWork;
+
+    // Keep the card inside the main window: a menu belongs to this window,
+    // and a long list scrolls instead of floating over other applications.
+    RECT client;
+    GetClientRect(hwnd, &client);
+    int anchorY = anchor.top - util::Scale(4, dpi);
+    int avail = anchorY - 2 * (shadow + padV) - util::Scale(16, dpi);
+    if (avail < util::Scale(120, dpi))
+        avail = util::Scale(120, dpi);
+    int want = st.contentH < avail ? st.contentH : avail;
+    int acc = 0;
+    for (size_t i = 0; i < st.visuals.size(); i++) {
+        int hh = chrome.menuItemHeight(st.visuals[i].kind);
+        if (acc + hh > want)
+            break;
+        acc += hh;
+        st.viewH = acc;                 // never cut a row in half
+    }
+    if (st.viewH == 0)
+        st.viewH = want;
+
+    int cardH = st.viewH + 2 * padV;
+    st.bmpW = cardW + 2 * shadow;
+    st.bmpH = cardH + 2 * shadow;
+    int x = pt.x - cardW - shadow;
+    int y = pt.y - cardH - shadow;
+    if (x < wa.left + 4) x = wa.left + 4;
+    if (x + st.bmpW > wa.right - 4) x = wa.right - 4 - st.bmpW;
+    if (y < wa.top + 4) y = wa.top + 4;
+    if (y + st.bmpH > wa.bottom - 4) y = wa.bottom - 4 - st.bmpH;
+    st.card = RECT{shadow, shadow, shadow + cardW, shadow + cardH};
+
+    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+    st.hwnd = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        L"WMPVMENU", L"", WS_POPUP, x, y, st.bmpW, st.bmpH,
+        hwnd, nullptr, hInst, nullptr);
+    if (!st.hwnd)
+        return 0;
+
+    g_popup = &st;
     menuOpen = true;
     setLayerVisible(false, true);
-    int cmd = (int)TrackPopupMenuEx(hmenu,
-                                    TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD,
-                                    pt.x, pt.y, hwnd, nullptr);
+    ShowWindow(st.hwnd, SW_SHOWNOACTIVATE);
+    renderPopup();
+
+    // Menus normally open from WM_LBUTTONDOWN: ignore the button that is still
+    // physically held so the popup is not dismissed by the very same click.
+    while (!st.done &&
+           ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ||
+            (GetAsyncKeyState(VK_RBUTTON) & 0x8000))) {
+        MSG tmp;
+        while (PeekMessageW(&tmp, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&tmp);
+            DispatchMessageW(&tmp);
+        }
+        Sleep(12);
+    }
+
+    bool pressed = false;
+    int pressHit = -1;
+    while (!st.done) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                PostQuitMessage((int)msg.wParam);
+                st.done = true;
+                break;
+            }
+            if (msg.message == WM_KEYDOWN) {
+                int key = (int)msg.wParam;
+                if (key == VK_ESCAPE) {
+                    st.done = true;
+                } else if (key == VK_UP) {
+                    PopupMove(-1);
+                } else if (key == VK_DOWN) {
+                    PopupMove(1);
+                } else if (key == VK_HOME || key == VK_PRIOR) {
+                    st.scrollY = 0;
+                    st.hot = -1;
+                    if (key == VK_HOME) PopupMove(1);
+                    else renderPopup();
+                } else if (key == VK_END || key == VK_NEXT) {
+                    st.scrollY = st.contentH - st.viewH;
+                    if (st.scrollY < 0) st.scrollY = 0;
+                    st.hot = -1;
+                    if (key == VK_END) PopupMove(-1);
+                    else renderPopup();
+                } else if (key == VK_RETURN || key == VK_SPACE) {
+                    if (st.hot >= 0)
+                        st.result = (int)st.ids[st.hot];
+                    st.done = true;
+                } else {
+                    st.done = true;      // any other key dismisses the menu
+                }
+                continue;                // never reaches the player shortcuts
+            }
+            if (msg.message == WM_CHAR || msg.message == WM_KEYUP)
+                continue;
+            if (msg.message == WM_MOUSEWHEEL) {
+                int d = GET_WHEEL_DELTA_WPARAM(msg.wParam);
+                PopupScrollBy(d > 0 ? -chrome.menuItemHeight(0) : chrome.menuItemHeight(0));
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (st.done)
+            break;
+
+        HWND fg = GetForegroundWindow();
+        if (st.baseFg && fg && fg != st.baseFg) {
+            st.done = true;             // focus moved to another application
+            break;
+        }
+
+        POINT cp;
+        GetCursorPos(&cp);
+        POINT rel = cp;
+        ScreenToClient(st.hwnd, &rel);
+        int hit = PopupHit(rel.x, rel.y);
+        int newHot = hit >= 0 ? hit : -1;
+        if (newHot != st.hot) {
+            st.hot = newHot;
+            renderPopup();
+        }
+        bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+                    (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (down) {
+            if (!pressed) {
+                pressed = true;
+                pressHit = hit;
+            }
+        } else if (pressed) {
+            if (pressHit >= 0 && hit == pressHit)
+                st.result = (int)st.ids[pressHit];
+            st.done = true;
+            break;
+        }
+        Sleep(12);
+    }
+
+    g_popup = nullptr;
+    DestroyWindow(st.hwnd);
     menuOpen = false;
-    DestroyMenu(hmenu);
-    DeleteObject(menuBg);
     updateLayers(lastMouseX, lastMouseY);
-    return cmd;
+    return st.result;
 }
 
 void App::showSubtitleMenu() {
@@ -916,27 +1176,6 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             InvalidateRect(w, nullptr, TRUE);
         }
         return DefWindowProcW(w, m, wp, lp);
-    case WM_MEASUREITEM: {
-        MEASUREITEMSTRUCT *ms = (MEASUREITEMSTRUCT *)lp;
-        if (ms->CtlType == ODT_MENU && ms->itemData) {
-            MenuItem *it = (MenuItem *)ms->itemData;
-            ms->itemWidth = app->chrome.menuItemWidth();
-            ms->itemHeight = app->chrome.menuItemHeight(it->v.kind);
-            return TRUE;
-        }
-        return DefWindowProcW(w, m, wp, lp);
-    }
-    case WM_DRAWITEM: {
-        DRAWITEMSTRUCT *ds = (DRAWITEMSTRUCT *)lp;
-        if (ds->CtlType == ODT_MENU && ds->itemData) {
-            MenuItem *it = (MenuItem *)ds->itemData;
-            app->chrome.paintMenuItem(ds->hDC, ds->rcItem, it->v,
-                                      (ds->itemState & ODS_SELECTED) != 0,
-                                      (ds->itemState & ODS_DISABLED) != 0);
-            return TRUE;
-        }
-        return DefWindowProcW(w, m, wp, lp);
-    }
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(w, &ps);
@@ -1135,7 +1374,57 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     }
 }
 
+// ---------- version ----------
+
+static bool WantsVersion(const wchar_t *cmdLine) {
+    int argc = 0;
+    wchar_t **argv = CommandLineToArgvW(cmdLine, &argc);
+    if (!argv)
+        return false;
+    bool found = false;
+    for (int i = 1; i < argc; i++) {
+        if (!wcscmp(argv[i], L"--version") || !wcscmp(argv[i], L"-V")) {
+            found = true;
+            break;
+        }
+    }
+    LocalFree(argv);
+    return found;
+}
+
+static void PrintVersion() {
+    std::string text = std::string("wmpv ") + WMPV_VERSION + "\n" +
+                       WMPV_FILE_DESC + "\n" + WMPV_COPYRIGHT + "\n" +
+                       "License: GPL-2.0-or-later\n";
+    // A WIN32-subsystem app has no stdout: borrow the caller's console when
+    // started from a shell, otherwise show a message box.
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+        bool opened = false;
+        if (!out || out == INVALID_HANDLE_VALUE) {
+            // GUI processes often get no inherited std handles; CONOUT$ is
+            // usable once we have attached to the parent console.
+            out = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            opened = (out != INVALID_HANDLE_VALUE);
+        }
+        if (out && out != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(out, text.c_str(), (DWORD)text.size(), &written, nullptr);
+        }
+        if (opened)
+            CloseHandle(out);
+        FreeConsole();
+    } else {
+        MessageBoxA(nullptr, text.c_str(), "wmpv", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+    if (WantsVersion(GetCommandLineW())) {
+        PrintVersion();
+        return 0;
+    }
     i18n::Init(GetCommandLineW());
     util::InitDwm();
     GdiplusStartupInput gpsi;
@@ -1156,6 +1445,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     lc.lpszClassName = L"WMPVLAYER";
     lc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&lc);
+
+    WNDCLASSW pc = {0};
+    pc.lpfnWndProc = PopupWndProc;
+    pc.hInstance = hInst;
+    pc.lpszClassName = L"WMPVMENU";
+    pc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassW(&pc);
 
     ui::Theme theme = ui::GetSystemTheme();
     HBRUSH bg = CreateSolidBrush(theme.panel);

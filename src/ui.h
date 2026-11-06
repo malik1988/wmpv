@@ -39,6 +39,7 @@ public:
     void resize(int cx, int cy) { cx_ = cx; cy_ = cy; compute(); }
     void setMode(bool fullscreen, bool bars) { fullscreen_ = fullscreen; bars_ = bars; compute(); }
     void setMaximized(bool m) { maximized_ = m; }
+    void setFullscreen(bool f) { fullscreen_ = f; }   // switches the fullscreen glyph
 
     void setState(const PlayerState &s) { state_ = s; compute(); }
     void setSubtitle(const SubtitleInfo &s) { sub_ = s; }
@@ -63,9 +64,18 @@ public:
     void paintTitleLayer(Gdiplus::Graphics *g);
     void paintControlsLayer(Gdiplus::Graphics *g);
     void paintEmpty(HDC hdc, const RECT &r);
-    void paintMenuItem(HDC hdc, const RECT &r, const MenuVisual &v, bool selected, bool disabled);
+
+    // The popup is a 32bpp PARGB layered window: card is its rounded rectangle
+    // in window coordinates, rows are clipped/scrolled inside it.
+    void paintMenu(Gdiplus::Graphics *g, const RECT &card, const MenuVisual *items,
+                   int count, int hot, int scrollY, int viewH);
+    void paintMenuItem(Gdiplus::Graphics *g, const RECT &r, const MenuVisual &v,
+                       bool selected, bool disabled);
     int menuItemWidth() const;
     int menuItemHeight(int kind) const;
+    int menuShadowPad() const;
+    int menuPadV() const;
+    int menuRadius() const;
     Ctrl hitTest(int x, int y) const;
     double seekFraction(int x) const;
     double volumeFraction(int x) const;

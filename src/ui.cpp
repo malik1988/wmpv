@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "i18n.h"
+#include "version.h"
 #include <cmath>
 #include <cwchar>
 #include <gdiplus.h>
@@ -329,18 +330,31 @@ void Chrome::drawClose(Graphics *g, const RECT &r, bool hover) {
 }
 
 void Chrome::drawFullscreen(Graphics *g, const RECT &r) {
-    int w = r.right - r.left;
-    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-    int s = (int)(w * 0.18), len = (int)(w * 0.17);
+    // Four diagonal arrows pointing outwards = "expand to full screen".
+    // While in full screen they point inwards = "restore window".
+    int w = r.right - r.left, h = r.bottom - r.top;
+    int u = w < h ? w : h;
+    REAL cx = (REAL)(r.left + r.right) / 2, cy = (REAL)(r.top + r.bottom) / 2;
+    REAL outer = (REAL)u * 0.27f;
+    REAL shaft = (REAL)u * 0.17f;
+    REAL wing = (REAL)u * 0.10f;
     Pen pen(GC(theme_.icon), (REAL)util::Scale(2, dpi_));
     pen.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
-    int corners[4][2] = {{cx - s, cy - s}, {cx + s, cy - s}, {cx - s, cy + s}, {cx + s, cy + s}};
     for (int i = 0; i < 4; i++) {
-        int x = corners[i][0], y = corners[i][1];
-        int sx = (i == 0 || i == 2) ? 1 : -1;
-        int sy = (i == 0 || i == 1) ? 1 : -1;
-        g->DrawLine(&pen, x, y, x + sx * len, y);
-        g->DrawLine(&pen, x, y, x, y + sy * len);
+        REAL sx = (i == 0 || i == 2) ? -1.0f : 1.0f;
+        REAL sy = (i == 0 || i == 1) ? -1.0f : 1.0f;
+        REAL xo = cx + sx * outer, yo = cy + sy * outer;
+        REAL xi = cx + sx * (outer - shaft), yi = cy + sy * (outer - shaft);
+        REAL tx = xo, ty = yo;                       // arrow head
+        REAL bx = xi, by = yi;                       // arrow tail
+        if (fullscreen_) {
+            tx = xi; ty = yi;
+            bx = xo; by = yo;
+        }
+        REAL back = fullscreen_ ? wing : -wing;   // wings trail away from the head
+        g->DrawLine(&pen, bx, by, tx, ty);
+        g->DrawLine(&pen, tx, ty, tx + sx * back, ty);
+        g->DrawLine(&pen, tx, ty, tx, ty + sy * back);
     }
 }
 
@@ -383,23 +397,41 @@ void Chrome::drawSpeed(Graphics *g, const RECT &r, double speed, bool hover) {
 }
 
 void Chrome::drawVolume(Graphics *g, const RECT &r, bool muted) {
+    // A complete speaker: small neck rectangle plus a four-point cone, with
+    // two sound waves (or a cross) to the right of the mouth.
     int w = r.right - r.left, h = r.bottom - r.top;
-    int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-    int s = (int)(w * 0.18);
+    int u = w < h ? w : h;
+    REAL cx = (REAL)(r.left + r.right) / 2, cy = (REAL)(r.top + r.bottom) / 2;
     Pen pen(GC(theme_.icon), (REAL)util::Scale(2, dpi_));
     pen.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
     SolidBrush b(GC(theme_.icon));
-    g->FillRectangle(&b, cx - s, cy - (int)(h * 0.13), (int)(w * 0.09), (int)(h * 0.26));
-    Point pts[3] = {{cx - s + (int)(w * 0.09), cy - (int)(h * 0.13)},
-                    {cx - s + (int)(w * 0.20), cy - (int)(h * 0.26)},
-                    {cx - s + (int)(w * 0.20), cy + (int)(h * 0.26)}};
-    g->FillPolygon(&b, pts, 3);
+
+    REAL neckL = cx - (REAL)u * 0.28f;
+    REAL neckW = (REAL)u * 0.10f;
+    REAL neckH = (REAL)u * 0.15f;
+    REAL mouthX = neckL + neckW + (REAL)u * 0.14f;
+    REAL mouthH = (REAL)u * 0.27f;
+    g->FillRectangle(&b, RectF(neckL, cy - neckH / 2, neckW, neckH));
+    PointF cone[4] = {
+        PointF(neckL + neckW, cy - neckH / 2),
+        PointF(mouthX, cy - mouthH),
+        PointF(mouthX, cy + mouthH),
+        PointF(neckL + neckW, cy + neckH / 2)
+    };
+    g->FillPolygon(&b, cone, 4);
+
     if (!muted) {
-        g->DrawArc(&pen, cx - s, cy - (int)(h * 0.42), (int)(w * 0.44), (int)(h * 0.84), -40, 80);
+        REAL ax = neckL, ay = cy;
+        REAL radii[2] = {(REAL)u * 0.40f, (REAL)u * 0.54f};
+        for (int i = 0; i < 2; i++) {
+            REAL rad = radii[i];
+            g->DrawArc(&pen, ax - rad, ay - rad, rad * 2, rad * 2, -42, 84);
+        }
     } else {
-        int d = (int)(w * 0.13);
-        g->DrawLine(&pen, cx + s, cy - d, cx + s + d, cy + d);
-        g->DrawLine(&pen, cx + s + d, cy - d, cx + s, cy + d);
+        REAL d = (REAL)u * 0.10f;
+        REAL x0 = cx + (REAL)u * 0.12f;
+        g->DrawLine(&pen, x0 - d, cy - d, x0 + d, cy + d);
+        g->DrawLine(&pen, x0 + d, cy - d, x0 - d, cy + d);
     }
 }
 
@@ -678,72 +710,135 @@ void Chrome::paintEmpty(HDC hdc, const RECT &r) {
     DrawTextG(&g, i18n::T(i18n::Str::FormatsHint),
               RectF((REAL)t3.left, (REAL)t3.top, (REAL)(t3.right - t3.left), (REAL)(t3.bottom - t3.top)),
               (REAL)util::Scale(10, dpi_), false, theme_.textFaint, StringAlignmentCenter);
+
+    std::wstring ver = std::wstring(L"v") + WMPV_VERSION_W;
+    DrawTextG(&g, ver,
+              RectF((REAL)(r.right - m - util::Scale(120, dpi_)),
+                    (REAL)(r.bottom - m - util::Scale(24, dpi_)),
+                    (REAL)util::Scale(110, dpi_), (REAL)util::Scale(20, dpi_)),
+              (REAL)util::Scale(10, dpi_), false, theme_.textFaint, StringAlignmentFar);
 }
 
-// ---------- owner drawn popup menu ----------
+// ---------- translucent rounded popup menu ----------
 
-void Chrome::paintMenuItem(HDC hdc, const RECT &rc, const MenuVisual &v,
+int Chrome::menuShadowPad() const { return util::Scale(20, dpi_); }
+int Chrome::menuPadV() const { return util::Scale(8, dpi_); }
+int Chrome::menuRadius() const { return util::Scale(14, dpi_); }
+
+void Chrome::paintMenu(Graphics *g, const RECT &card, const MenuVisual *items,
+                       int count, int hot, int scrollY, int viewH) {
+    RectF cr((REAL)card.left, (REAL)card.top,
+             (REAL)(card.right - card.left), (REAL)(card.bottom - card.top));
+    REAL radius = (REAL)menuRadius();
+
+    SoftShadow(g, cr, radius, theme_.dark);
+    COLORREF top = theme_.dark ? blend(theme_.surface, theme_.surfaceAlt, 0.30)
+                               : theme_.surface;
+    COLORREF bottom = theme_.dark ? theme_.surface
+                                  : blend(theme_.surface, theme_.line, 0.35);
+    FillGradientRound(g, cr, radius, top, bottom, 232);
+
+    GraphicsPath edge;
+    RoundRectPath(edge, cr.X + 0.5f, cr.Y + 0.5f, cr.Width - 1, cr.Height - 1, radius);
+    Pen border(GC(theme_.dark ? RGB(255, 255, 255) : RGB(0, 0, 0),
+                  theme_.dark ? 48 : 24), 1);
+    g->DrawPath(&border, &edge);
+
+    REAL padV = (REAL)menuPadV();
+    g->SetClip(RectF(cr.X + 2, cr.Y + padV, cr.Width - 4, (REAL)viewH));
+    g->TranslateTransform(0, -(REAL)scrollY);
+    int y = card.top + (int)padV;
+    for (int i = 0; i < count; i++) {
+        int hh = menuItemHeight(items[i].kind);
+        RECT row = {card.left, y, card.right, y + hh};
+        paintMenuItem(g, row, items[i], i == hot, false);
+        y += hh;
+    }
+    g->ResetTransform();
+    g->ResetClip();
+
+    int contentH = y - card.top - (int)padV;
+    if (contentH > viewH) {
+        SolidBrush arrow(GC(theme_.textFaint, 170));
+        REAL ax = cr.X + cr.Width / 2;
+        if (scrollY > 0) {
+            PointF t[3] = {PointF(ax - 4, cr.Y + padV + 3),
+                           PointF(ax + 4, cr.Y + padV + 3),
+                           PointF(ax, cr.Y + padV - 2)};
+            g->FillPolygon(&arrow, t, 3);
+        }
+        if (scrollY < contentH - viewH) {
+            REAL by = cr.Y + padV + viewH - 2;
+            PointF t[3] = {PointF(ax - 4, by + 2), PointF(ax + 4, by + 2),
+                           PointF(ax, by + 7)};
+            g->FillPolygon(&arrow, t, 3);
+        }
+    }
+}
+
+void Chrome::paintMenuItem(Graphics *g, const RECT &rc, const MenuVisual &v,
                            bool selected, bool disabled) {
-    Graphics g(hdc);
-    g.SetSmoothingMode(SmoothingModeAntiAlias);
-    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    // No opaque row fill: the translucent card painted by paintMenu() shows through.
     RectF r((REAL)rc.left, (REAL)rc.top, (REAL)(rc.right - rc.left),
             (REAL)(rc.bottom - rc.top));
-    SolidBrush bg(GC(theme_.surface));
-    g.FillRectangle(&bg, r);
-
     REAL padL = (REAL)util::Scale(14, dpi_);
     if (v.kind == 2) {
-        Pen sep(GC(theme_.line, 190), 1);
-        g.DrawLine(&sep, r.X + padL, r.Y + r.Height / 2,
-                   r.GetRight() - padL, r.Y + r.Height / 2);
+        Pen sep(GC(theme_.line, 150), 1);
+        g->DrawLine(&sep, r.X + padL, r.Y + r.Height / 2,
+                    r.GetRight() - padL, r.Y + r.Height / 2);
         return;
     }
     if (v.kind == 1) {
-        DrawTextG(&g, v.text,
+        DrawTextG(g, v.text,
                   RectF(r.X + padL, r.Y, r.Width - padL * 2, r.Height),
                   (REAL)util::Scale(10, dpi_), true, theme_.textFaint);
         return;
     }
 
     REAL inset = (REAL)util::Scale(6, dpi_);
-    if (selected)
-        FillRound(&g, RectF(r.X + inset, r.Y + 1, r.Width - inset * 2, r.Height - 2),
-                  (REAL)util::Scale(8, dpi_), GC(theme_.surfaceAlt));
+    if (selected) {
+        FillRound(g, RectF(r.X + inset, r.Y + 1, r.Width - inset * 2, r.Height - 2),
+                  (REAL)util::Scale(8, dpi_),
+                  GC(theme_.hover, theme_.dark ? 26 : 16));
+        REAL barW = (REAL)util::Scale(3, dpi_);
+        FillRound(g, RectF(r.X + (REAL)util::Scale(3, dpi_),
+                           r.Y + r.Height * 0.26f, barW, r.Height * 0.48f),
+                  barW / 2, GC(theme_.accent, 235));
+    }
 
     REAL d = (REAL)util::Scale(13, dpi_);
     REAL markY = r.Y + (r.Height - d) / 2;
     if (v.kind == 3) {
         Pen ring(GC(v.checked ? theme_.accent : theme_.textFaint, 220), 1.3f);
-        g.DrawEllipse(&ring, RectF(r.X + padL, markY, d, d));
+        g->DrawEllipse(&ring, RectF(r.X + padL, markY, d, d));
         if (v.checked) {
             SolidBrush dot(GC(theme_.accent));
-            g.FillEllipse(&dot, RectF(r.X + padL + d * 0.28, markY + d * 0.28,
-                                      d * 0.44, d * 0.44));
+            g->FillEllipse(&dot, RectF(r.X + padL + d * 0.28, markY + d * 0.28,
+                                       d * 0.44, d * 0.44));
         }
     } else if (v.kind == 4) {
         Pen box(GC(v.checked ? theme_.accent : theme_.textFaint, 220), 1.3f);
         GraphicsPath bp;
         RoundRectPath(bp, r.X + padL, markY, d, d, 3);
-        g.DrawPath(&box, &bp);
+        g->DrawPath(&box, &bp);
         if (v.checked) {
             Pen tick(GC(theme_.accent), 2.0f);
             tick.SetLineCap(LineCapRound, LineCapRound, DashCapRound);
-            g.DrawLine(&tick, r.X + padL + 3, markY + d * 0.55,
-                       r.X + padL + d * 0.43, markY + d * 0.78);
-            g.DrawLine(&tick, r.X + padL + d * 0.43, markY + d * 0.78,
-                       r.X + padL + d - 2, markY + 2);
+            g->DrawLine(&tick, r.X + padL + 3, markY + d * 0.55,
+                        r.X + padL + d * 0.43, markY + d * 0.78);
+            g->DrawLine(&tick, r.X + padL + d * 0.43, markY + d * 0.78,
+                        r.X + padL + d - 2, markY + 2);
         }
     }
 
     REAL tx = r.X + (REAL)util::Scale(36, dpi_);
     REAL hintW = (REAL)util::Scale(96, dpi_);
     REAL textW = r.GetRight() - tx - (v.hint.empty() ? padL : hintW + padL);
-    DrawTextG(&g, v.text, RectF(tx, r.Y, textW, r.Height),
+    DrawTextG(g, v.text, RectF(tx, r.Y, textW, r.Height),
               (REAL)util::Scale(12, dpi_), false,
               disabled ? theme_.textFaint : theme_.text);
     if (!v.hint.empty()) {
-        DrawTextG(&g, v.hint,
+        DrawTextG(g, v.hint,
                   RectF(r.GetRight() - hintW - padL, r.Y, hintW, r.Height),
                   (REAL)util::Scale(10, dpi_), false, theme_.textFaint, StringAlignmentFar);
     }
